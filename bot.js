@@ -35,7 +35,6 @@ async function initDb() {
         )
     `);
     
-    // Perombakan Tabel untuk Support Multi-Account iVAS
     await dbRun(`
         CREATE TABLE IF NOT EXISTS ivas_accounts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -156,7 +155,7 @@ const KEYBOARDS = {
         const kb = [
             [{ text: '🔍 Dapatkan OTP', callback_data: 'btn_get_otp' }, { text: '📱 Daftar Nomor', callback_data: 'btn_mynumbers' }],
             [{ text: '💰 Cek Saldo Total', callback_data: 'btn_balance' }, { text: '🔄 Status Multi-Akun', callback_data: 'btn_status' }],
-            [{ text: '⚙️ Tambah Akun / Cookie', callback_data: 'btn_howto_cookie' }],
+            [{ text: '⚙️ Tambah Akun iVAS', callback_data: 'btn_add_account' }],
             [{ text: '👨‍💻 Hubungi Founder', url: 'https://t.me/pansagr' }]
         ];
         if (role === 'superadmin') {
@@ -186,7 +185,7 @@ async function renderMainMenu(chatId, userId, messageId = null) {
         return bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
     }
 
-    text += `Pilih menu pada panel interaktif di bawah ini untuk mengoperasikan sistem jaringan Multi-Account.\n`;
+    text += `Silakan pilih menu pada panel interaktif di bawah ini.\n`;
     text += UI.divider + UI.footer;
     const opts = { parse_mode: 'HTML', ...KEYBOARDS.mainMenu(auth.role) };
 
@@ -211,23 +210,19 @@ async function processOtpTracking(chatId, userId, fullNumber) {
     let targetAccount = null;
     const dateStr = new Date().toISOString().split('T')[0];
 
-    // TAHAP 1: AUTO-ROUTING (Cari akun mana yang memiliki nomor ini)
+    // Auto-Routing: Cari akun pemilik nomor
     for (const acc of accounts) {
         try {
             const params = new URLSearchParams({ draw: 1, start: 0, length: 2000, 'search[value]': '' });
             const res = await axios.get(`${BASE_URL}/portal/numbers?${params.toString()}`, {
                 headers: { 'User-Agent': acc.user_agent, 'X-Requested-With': 'XMLHttpRequest', 'Cookie': buildCookieString(acc) }
             });
-            
             if (res.status === 200 && res.data?.data) {
-                // Cek apakah nomor target (full number) ada di akun ini
-                const found = res.data.data.find(item => item.Number.toString() === fullNumber);
-                if (found) {
-                    targetAccount = acc;
-                    break;
+                if (res.data.data.find(item => item.Number.toString() === fullNumber)) {
+                    targetAccount = acc; break;
                 }
             }
-        } catch (e) { /* Lanjut cek akun berikutnya jika terjadi error */ }
+        } catch (e) {}
     }
 
     if (!targetAccount) {
@@ -235,7 +230,7 @@ async function processOtpTracking(chatId, userId, fullNumber) {
         return bot.sendMessage(chatId, UI.header('Hasil Radar') + `📭 Nomor <code>${fullNumber}</code> tidak ditemukan di semua akun yang terdaftar.\n` + UI.divider + UI.footer, { parse_mode: 'HTML' });
     }
 
-    // TAHAP 2: Live Tracking di Akun Target
+    // Live Tracking Polling
     const MAX_ATTEMPTS = 20; 
     let otpFound = false;
 
@@ -245,9 +240,7 @@ async function processOtpTracking(chatId, userId, fullNumber) {
             { chat_id: chatId, message_id: currentStatusMsg.message_id, parse_mode: 'HTML' }
         ).catch(() => {});
 
-        const payload = new URLSearchParams({ 
-            '_token': targetAccount.csrf_token, 'start': dateStr, 'end': dateStr, 'Number': fullNumber, 'Range': '' 
-        });
+        const payload = new URLSearchParams({ '_token': targetAccount.csrf_token, 'start': dateStr, 'end': dateStr, 'Number': fullNumber, 'Range': '' });
 
         try {
             const res = await axios.post(`${BASE_URL}/portal/sms/received/getsms/number/sms`, payload.toString(), {
@@ -294,18 +287,17 @@ async function processOtpTracking(chatId, userId, fullNumber) {
 
     if (!otpFound) {
         bot.deleteMessage(chatId, currentStatusMsg.message_id).catch(() => {});
-        bot.sendMessage(chatId, UI.header('Timeout') + `⏱️ <b>Batas Waktu Habis</b>\nOTP tidak tiba di nomor <code>${fullNumber}</code> setelah 80 detik.\nKirim ulang dari aplikasi, lalu ulangi proses.\n` + UI.divider + UI.footer, { parse_mode: 'HTML' });
+        bot.sendMessage(chatId, UI.header('Timeout') + `⏱️ <b>Batas Waktu Habis</b>\nOTP tidak tiba di nomor <code>${fullNumber}</code> setelah 80 detik.\n` + UI.divider + UI.footer, { parse_mode: 'HTML' });
     }
 }
 
 // ==========================================
-// 💬 TELEGRAM COMMAND HANDLERS
+// 💬 TELEGRAM BUTTON & CALLBACK HANDLERS
 // ==========================================
 
-// --- COMMAND: /start ---
+// Pintu masuk satu-satunya (TIDAK ADA COMMAND LAIN)
 bot.onText(/\/start/, (msg) => renderMainMenu(msg.chat.id, msg.from.id));
 
-// --- BUTTON CLICK HANDLER (CALLBACK QUERIES) ---
 bot.on('callback_query', async (query) => {
     const chatId = query.message.chat.id;
     const messageId = query.message.message_id;
@@ -320,15 +312,22 @@ bot.on('callback_query', async (query) => {
             await renderMainMenu(chatId, userId, messageId);
         } 
         
-        // --- BUTTON: GET OTP (FULL NUMBER FORCE REPLY) ---
         else if (action === 'btn_get_otp') {
             bot.deleteMessage(chatId, messageId).catch(() => {}); 
-            bot.sendMessage(chatId, `🔍 <b>Silakan balas (reply) pesan ini dengan FULL NOMOR target Anda:</b>\n(Contoh: 6281234567890)`, {
+            bot.sendMessage(chatId, `🔍 <b>Balas (reply) pesan ini dengan FULL NOMOR target Anda:</b>\n(Tanpa + atau spasi, contoh: 6281234567890)`, {
                 parse_mode: 'HTML',
                 reply_markup: { force_reply: true, selective: true }
             });
         }
         
+        else if (action === 'btn_add_account') {
+            bot.deleteMessage(chatId, messageId).catch(() => {}); 
+            bot.sendMessage(chatId, `⚙️ <b>Balas (reply) pesan ini dengan format berikut untuk menambah Akun iVAS:</b>\n\n<code>NAMA_AKUN ivas_sms_session xsrf_token</code>\n\nContoh:\n<code>AKUN_1 eyJpd... VZDLZ...</code>`, {
+                parse_mode: 'HTML',
+                reply_markup: { force_reply: true, selective: true }
+            });
+        }
+
         else if (action === 'btn_status') {
             const accounts = await dbAll('SELECT name, updated_at FROM ivas_accounts');
             let text = UI.header('Status Multi-Akun');
@@ -336,9 +335,7 @@ bot.on('callback_query', async (query) => {
                 text += `❌ <b>Sistem Kosong:</b> Belum ada akun yang terdaftar.\n`;
             } else {
                 text += `🟢 <b>Terdapat ${accounts.length} Akun Aktif:</b>\n\n`;
-                accounts.forEach((acc, idx) => {
-                    text += `<b>${idx+1}. [${acc.name}]</b>\n⏳ Sync: <code>${acc.updated_at}</code>\n\n`;
-                });
+                accounts.forEach((acc, idx) => { text += `<b>${idx+1}. [${acc.name}]</b>\n⏳ Sync: <code>${acc.updated_at}</code>\n\n`; });
             }
             text += UI.divider + UI.footer;
             bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.backButton });
@@ -393,28 +390,34 @@ bot.on('callback_query', async (query) => {
             bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.backButton });
         }
 
-        else if (action === 'btn_howto_cookie') {
-            let text = UI.header('Cara Set Multi-Akun');
-            text += `Tambahkan akun iVAS ke dalam sistem dengan perintah:\n\n`;
-            text += `👉 <code>/setcookies [NAMA_AKUN] [ivas_session] [XSRF-TOKEN]</code>\n\n`;
-            text += `<b>Contoh:</b>\n<code>/setcookies AKUN_UTAMA eyJpd... VZDLZ...</code>\n\n`;
-            text += `<i>Anda bisa menambahkan puluhan akun berbeda ke dalam 1 bot ini.</i>\n`;
-            text += UI.divider + UI.footer;
-            bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.backButton });
-        }
-
         else if (action === 'btn_admin' && auth.role === 'superadmin') {
             const rows = await dbAll('SELECT telegram_id, created_at FROM users WHERE role = "admin"');
             let text = UI.header('Admin Console');
-            text += `<b>Cara Tambah Admin:</b>\nKetik: <code>/addadmin [ID_TELEGRAM]</code>\n\n`;
             text += `📋 <b>Daftar Admin Aktif:</b>\n`;
             if (rows.length === 0) {
-                text += `<i>Belum ada admin yang terdaftar.</i>\n`;
+                text += `<i>Belum ada admin terdaftar.</i>\n\n`;
             } else {
                 rows.forEach((row, i) => { text += `${i + 1}. <code>${row.telegram_id}</code>\n`; });
+                text += `\n`;
             }
             text += UI.divider + UI.footer;
-            bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.backButton });
+            
+            // Tambahkan tombol untuk Add Admin di dalam panel Superadmin
+            const adminKb = {
+                inline_keyboard: [
+                    [{ text: '➕ Tambah Admin Baru', callback_data: 'btn_add_admin_prompt' }],
+                    [{ text: '🔙 Kembali ke Dashboard', callback_data: 'btn_main' }]
+                ]
+            };
+            bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: adminKb });
+        }
+
+        else if (action === 'btn_add_admin_prompt' && auth.role === 'superadmin') {
+            bot.deleteMessage(chatId, messageId).catch(() => {});
+            bot.sendMessage(chatId, `👑 <b>Balas (reply) pesan ini dengan ID Telegram Admin Baru:</b>\n(Pastikan hanya memasukkan angka)`, {
+                parse_mode: 'HTML',
+                reply_markup: { force_reply: true, selective: true }
+            });
         }
 
         bot.answerCallbackQuery(query.id); 
@@ -423,76 +426,65 @@ bot.on('callback_query', async (query) => {
     }
 });
 
-
-// --- MESSAGE LISTENER (Menangkap input FULL NOMOR untuk OTP) ---
+// ==========================================
+// 📥 MASTER MESSAGE LISTENER (FORCE REPLY CATCHER)
+// ==========================================
 bot.on('message', async (msg) => {
-    if (msg.text && msg.text.startsWith('/')) return;
+    if (!msg.text || msg.text.startsWith('/start')) return; // Abaikan /start
 
-    // Deteksi jika user membalas pesan "FULL NOMOR"
-    if (msg.reply_to_message && msg.reply_to_message.text && msg.reply_to_message.text.includes('FULL NOMOR')) {
-        const fullNumber = msg.text.replace(/\D/g, ''); // Hapus semua karakter selain angka (contoh: + atau spasi)
-        
-        // Validasi input panjang nomor (minimal 8 digit)
-        if (fullNumber.length < 8) {
-            return bot.sendMessage(msg.chat.id, "❌ <b>Format salah!</b> Harap masukkan nomor lengkap yang valid (tanpa +).", { parse_mode: 'HTML' });
-        }
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const text = msg.text.trim();
 
-        const auth = await isAuthorized(msg.from.id);
+    // Deteksi jika user membalas pesan prompt dari bot
+    if (msg.reply_to_message && msg.reply_to_message.text) {
+        const promptText = msg.reply_to_message.text;
+
+        const auth = await isAuthorized(userId);
         if (!auth.authorized) return;
 
-        // Eksekusi Live Tracking Multi-Account
-        await processOtpTracking(msg.chat.id, msg.from.id, fullNumber);
+        // 1. HANDLER: MENCARI OTP (FULL NOMOR)
+        if (promptText.includes('FULL NOMOR')) {
+            const fullNumber = text.replace(/\D/g, ''); 
+            if (fullNumber.length < 8) return bot.sendMessage(chatId, "❌ <b>Format salah!</b> Harap masukkan nomor lengkap yang valid.", { parse_mode: 'HTML' });
+            await processOtpTracking(chatId, userId, fullNumber);
+        }
+        
+        // 2. HANDLER: TAMBAH AKUN (COOKIES)
+        else if (promptText.includes('NAMA_AKUN ivas_sms_session')) {
+            const parts = text.split(/\s+/);
+            if (parts.length < 3) return bot.sendMessage(chatId, "❌ <b>Format salah!</b> Pastikan dipisahkan oleh spasi:\nNAMA_AKUN ivas_session xsrf_token", { parse_mode: 'HTML' });
+            
+            const [accountName, ivasSession, xsrfToken] = parts;
+            const loadingMsg = await bot.sendMessage(chatId, `⏳ <b>[PANSA SYSTEM]</b> Menautkan Akun <b>[${accountName}]</b>...`, { parse_mode: 'HTML' });
+
+            try {
+                const data = await refreshCfClearance(accountName, ivasSession, xsrfToken);
+                let reply = UI.header('Akun Terhubung');
+                reply += `✅ <b>Akun [${accountName}] Berhasil Ditambahkan!</b>\n\n🔑 <b>CSRF Token:</b>\n<code>${data.csrfToken ? data.csrfToken.substring(0, 24) : 'N/A'}...</code>\n🌐 <b>Kapasitas Node:</b> Bertambah.\n` + UI.divider + UI.footer;
+                bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+                bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
+            } catch (e) {
+                bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
+                bot.sendMessage(chatId, UI.error(e.message), { parse_mode: 'HTML' });
+            }
+        }
+
+        // 3. HANDLER: TAMBAH ADMIN (SUPERADMIN ONLY)
+        else if (promptText.includes('ID Telegram Admin Baru')) {
+            if (auth.role !== 'superadmin') return bot.sendMessage(chatId, "❌ Akses Ditolak!");
+            
+            const targetId = parseInt(text.replace(/\D/g, ''));
+            if (isNaN(targetId)) return bot.sendMessage(chatId, "❌ ID tidak valid!");
+
+            try {
+                await dbRun('INSERT INTO users (telegram_id, role) VALUES (?, "admin") ON CONFLICT(telegram_id) DO UPDATE SET role="admin"', [targetId]);
+                bot.sendMessage(chatId, UI.header('Admin Added') + `🎯 <b>Admin Berhasil Ditambahkan</b>\n🔹 <b>Telegram ID:</b> <code>${targetId}</code>\n` + UI.divider + UI.footer, { parse_mode: 'HTML' });
+            } catch (e) { 
+                bot.sendMessage(chatId, UI.error(e.message), { parse_mode: 'HTML' }); 
+            }
+        }
     }
-});
-
-
-// --- COMMAND: /addadmin (Superadmin Only) ---
-bot.onText(/\/addadmin\s+(\d+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const targetId = parseInt(match[1]);
-
-    if (userId !== SUPERADMIN_ID) return;
-    try {
-        await dbRun('INSERT INTO users (telegram_id, role) VALUES (?, "admin") ON CONFLICT(telegram_id) DO UPDATE SET role="admin"', [targetId]);
-        bot.sendMessage(chatId, UI.header('Admin Added') + `🎯 <b>Admin Berhasil Ditambahkan</b>\n🔹 <b>Telegram ID:</b> <code>${targetId}</code>\n` + UI.divider + UI.footer, { parse_mode: 'HTML' });
-    } catch (e) { bot.sendMessage(chatId, UI.error(e.message), { parse_mode: 'HTML' }); }
-});
-
-
-// --- COMMAND: /setcookies <NamaAkun> <ivas> <xsrf> ---
-bot.onText(/\/setcookies\s+([^\s]+)\s+([^\s]+)\s+([^\s]+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    const userId = msg.from.id;
-    const auth = await isAuthorized(userId);
-    if (!auth.authorized) return;
-
-    const accountName = match[1].trim();
-    const ivasSession = match[2].trim();
-    const xsrfToken = match[3].trim();
-
-    const loadingMsg = await bot.sendMessage(chatId, `⏳ <b>[PANSA SYSTEM]</b> Menautkan Akun <b>[${accountName}]</b> ke sistem & mem-bypass proteksi...`, { parse_mode: 'HTML' });
-
-    try {
-        const data = await refreshCfClearance(accountName, ivasSession, xsrfToken);
-        let text = UI.header('Akun Terhubung');
-        text += `✅ <b>Akun [${accountName}] Berhasil Ditambahkan!</b>\n\n🔑 <b>CSRF Token:</b>\n<code>${data.csrfToken ? data.csrfToken.substring(0, 24) : 'N/A'}...</code>\n🌐 <b>Kapasitas Node:</b> Bertambah.\n` + UI.divider + UI.footer;
-        bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
-        bot.sendMessage(chatId, text, { parse_mode: 'HTML' });
-    } catch (e) {
-        bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
-        bot.sendMessage(chatId, UI.error(e.message), { parse_mode: 'HTML' });
-    }
-});
-
-
-// Fallback /otp manual menggunakan Full Nomor (opsional)
-bot.onText(/\/otp\s+(\d+)/, async (msg, match) => {
-    const auth = await isAuthorized(msg.from.id);
-    if (!auth.authorized) return;
-    const fullNumber = match[1];
-    if(fullNumber.length < 8) return bot.sendMessage(msg.chat.id, "❌ Harap masukkan FULL NOMOR. Contoh: /otp 6281234567890", { parse_mode: 'HTML' });
-    await processOtpTracking(msg.chat.id, msg.from.id, fullNumber);
 });
 
 // ==========================================
@@ -501,6 +493,6 @@ bot.onText(/\/otp\s+(\d+)/, async (msg, match) => {
 async function bootstrap() {
     await initDb();
     await autoRefreshSessionsOnStartup();
-    console.log('🤖 PANSA GROUP OTP Bot (Multi-Node Edition) berjalan...');
+    console.log('🤖 PANSA GROUP OTP Bot (Full-Button Edition) berjalan...');
 }
 bootstrap().catch(console.error);
