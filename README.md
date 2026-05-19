@@ -50,8 +50,8 @@ Pastikan VPS/server sudah terinstall:
 ## 1. Clone Project
 
 ```bash
-git clone https://github.com/yourusername/pansa-otp-bot.git
-cd pansa-otp-bot
+git clone https://github.com/jhodypedia/ivas.git
+cd ivas
 ```
 
 ---
