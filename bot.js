@@ -19,7 +19,7 @@ if (!BOT_TOKEN || !SUPERADMIN_ID) {
 }
 
 // ==========================================
-// 📦 INISIALISASI DATABASE SQLITE
+// 📦 DATABASE SQLITE
 // ==========================================
 const db = new sqlite3.Database('pansa_otp.db');
 db.run('PRAGMA journal_mode=WAL');
@@ -56,7 +56,7 @@ async function initDb() {
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
 // ==========================================
-// 🛠 FUNGSI HELPER & AUTH
+// 🛠 HELPER
 // ==========================================
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -87,12 +87,6 @@ function buildCookieString(account) {
 // ==========================================
 // 🕸️ FLARESOLVERR — HANYA UNTUK cf_clearance
 // ==========================================
-
-/**
-* Ambil cf_clearance cookie dari Cloudflare via FlareSolverr
-* Tidak untuk login, tidak untuk request lain
-* Hanya untuk bypass Cloudflare JS Challenge
-*/
 async function getCfClearance() {
    console.log('🔄 [FlareSolverr] Mengambil cf_clearance...');
 
@@ -103,7 +97,9 @@ async function getCfClearance() {
                cmd: 'request.get',
                url: BASE_URL,
                maxTimeout: 120000,
-           }, { timeout: 130000 });
+           }, {
+               timeout: 180000, // 3 menit — beri waktu cukup untuk solve challenge
+           });
 
            if (res.data.status !== 'ok') {
                throw new Error(`FlareSolverr error: ${res.data.message}`);
@@ -112,12 +108,12 @@ async function getCfClearance() {
            const solution = res.data.solution;
            const cfCookie = solution.cookies.find(c => c.name === 'cf_clearance');
 
-           if (!cfCookie || !cfCookie.value) {
-               throw new Error('cf_clearance tidak ditemukan dalam response FlareSolverr');
+           if (!cfCookie?.value) {
+               throw new Error('cf_clearance tidak ditemukan dalam response');
            }
 
            console.log(`✅ [FlareSolverr] cf_clearance berhasil didapat`);
-           console.log(`   Expires: ${new Date(cfCookie.expiry * 1000).toLocaleString('id-ID')}`);
+           console.log(`   UA: ${solution.userAgent}`);
 
            return {
                cf_clearance: cfCookie.value,
@@ -128,27 +124,24 @@ async function getCfClearance() {
        } catch (err) {
            retries--;
            console.error(`❌ [FlareSolverr] Gagal: ${err.message} | Sisa retry: ${retries}`);
-           if (retries > 0) await delay(5000);
+           if (retries > 0) {
+               console.log('⏳ Tunggu 10 detik sebelum retry...');
+               await delay(10000);
+           }
        }
    }
 
-   throw new Error('FlareSolverr gagal setelah 3 kali percobaan');
+   throw new Error('FlareSolverr gagal setelah 3 kali percobaan. Cek docker logs flaresolverr');
 }
 
 // ==========================================
 // 🔄 SESSION MANAGEMENT
 // ==========================================
-
-/**
-* Refresh cf_clearance akun menggunakan FlareSolverr
-* Kemudian validasi session masih hidup dengan hit portal
-* Jika session expired, tandai di DB dan notif superadmin
-*/
 async function refreshCfClearance(accountName, ivasSession, xsrfToken) {
    // Step 1: Ambil cf_clearance baru dari FlareSolverr
    const { cf_clearance, userAgent } = await getCfClearance();
 
-   // Step 2: Validasi session masih hidup dengan hit portal ivasms
+   // Step 2: Validasi session masih hidup
    let csrfToken = null;
    let sessionValid = 1;
 
@@ -165,14 +158,12 @@ async function refreshCfClearance(accountName, ivasSession, xsrfToken) {
            timeout: 30000,
        });
 
-       const finalUrl = res.request?.res?.responseUrl || res.config?.url || '';
+       const finalUrl = res.request?.res?.responseUrl || '';
 
-       // Jika redirect ke /login → session expired
-       if (finalUrl.includes('/login') || res.data?.includes('Account Login')) {
+       if (finalUrl.includes('/login') || (res.data && res.data.includes('Account Login'))) {
            sessionValid = 0;
            console.warn(`⚠️ [${accountName}] Session expired!`);
        } else {
-           // Ambil CSRF token dari meta tag
            const $ = cheerio.load(res.data);
            csrfToken = $('meta[name="csrf-token"]').attr('content') || null;
            console.log(`✅ [${accountName}] Session valid | CSRF: ${csrfToken ? csrfToken.substring(0, 16) + '...' : 'N/A'}`);
@@ -180,7 +171,6 @@ async function refreshCfClearance(accountName, ivasSession, xsrfToken) {
 
    } catch (err) {
        console.error(`⚠️ [${accountName}] Gagal validasi portal: ${err.message}`);
-       // Jangan mark invalid hanya karena network error
    }
 
    // Step 3: Simpan ke database
@@ -188,11 +178,11 @@ async function refreshCfClearance(accountName, ivasSession, xsrfToken) {
        INSERT INTO ivas_accounts (name, ivas_sms_session, xsrf_token, cf_clearance, csrf_token, user_agent, session_valid, updated_at)
        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
        ON CONFLICT(name) DO UPDATE SET
-           cf_clearance    = excluded.cf_clearance,
-           csrf_token      = excluded.csrf_token,
-           user_agent      = excluded.user_agent,
-           session_valid   = excluded.session_valid,
-           updated_at      = CURRENT_TIMESTAMP
+           cf_clearance  = excluded.cf_clearance,
+           csrf_token    = excluded.csrf_token,
+           user_agent    = excluded.user_agent,
+           session_valid = excluded.session_valid,
+           updated_at    = CURRENT_TIMESTAMP
    `, [accountName, ivasSession, xsrfToken, cf_clearance, csrfToken, userAgent, sessionValid]);
 
    if (sessionValid === 0) {
@@ -202,9 +192,6 @@ async function refreshCfClearance(accountName, ivasSession, xsrfToken) {
    return { cf_clearance, csrfToken, userAgent };
 }
 
-/**
-* Refresh semua akun saat startup atau terjadwal
-*/
 async function refreshAllAccounts(notifyOnError = true) {
    const accounts = await dbAll('SELECT * FROM ivas_accounts');
    if (accounts.length === 0) {
@@ -220,7 +207,7 @@ async function refreshAllAccounts(notifyOnError = true) {
            console.error(`❌ [${acc.name}] ${err.message}`);
            if (notifyOnError) {
                bot.sendMessage(SUPERADMIN_ID,
-                   `⚠️ <b>SESSION EXPIRED</b>\n\nAkun <code>[${acc.name}]</code> perlu update cookies.\n\nGunakan menu ⚙️ <b>Tambah Akun iVAS</b> untuk update.`,
+                   `⚠️ <b>SESSION EXPIRED</b>\n\nAkun <code>[${acc.name}]</code> perlu update cookies.\n\nGunakan menu ⚙️ <b>Tambah/Update Akun iVAS</b>.`,
                    { parse_mode: 'HTML' }
                ).catch(() => {});
            }
@@ -230,12 +217,12 @@ async function refreshAllAccounts(notifyOnError = true) {
 }
 
 // ==========================================
-// 🎨 TEMPLATE UI & KEYBOARDS
+// 🎨 UI TEMPLATE & KEYBOARDS
 // ==========================================
 const UI = {
    header: (title) => `🪐 <b>PANSA GROUP • ${title.toUpperCase()}</b>\n━━━━━━━━━━━━━━━━━━━━━━\n`,
    divider: `━━━━━━━━━━━━━━━━━━━━━━\n`,
-   footer: `⚡ <i>Powered by Pansa Labs</i>\n👨 <b>Founder:</b> @pansagr`,
+   footer: `⚡ <i>Powered by Pansa Labs</i>\n👨‍💻 <b>Founder:</b> @pansagr`,
    error: (msg) => `⚠️ <b>SYSTEM ERROR</b>\n<code>${msg}</code>`,
 };
 
@@ -245,7 +232,7 @@ const KEYBOARDS = {
            [{ text: '🔍 Dapatkan OTP', callback_data: 'btn_get_otp' }, { text: '📱 Daftar Nomor', callback_data: 'btn_mynumbers' }],
            [{ text: '💰 Cek Saldo Total', callback_data: 'btn_balance' }, { text: '🔄 Status Multi-Akun', callback_data: 'btn_status' }],
            [{ text: '⚙️ Tambah/Update Akun iVAS', callback_data: 'btn_add_account' }],
-           [{ text: '👨‍💻 Hubungi Founder', url: 'https://t.me/pansagr' }],
+           [{ text: '👨 Hubungi Founder', url: 'https://t.me/pansagr' }],
        ];
        if (role === 'superadmin') {
            kb.push([{ text: '👑 Admin Console', callback_data: 'btn_admin' }]);
@@ -329,7 +316,9 @@ async function processOtpTracking(chatId, userId, fullNumber) {
    if (!targetAccount) {
        bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
        return bot.sendMessage(chatId,
-           UI.header('Hasil Radar') + `📭 Nomor <code>${fullNumber}</code> tidak ditemukan di semua akun.\n` + UI.divider + UI.footer,
+           UI.header('Hasil Radar') +
+           `📭 Nomor <code>${fullNumber}</code> tidak ditemukan di semua akun.\n` +
+           UI.divider + UI.footer,
            { parse_mode: 'HTML' }
        );
    }
@@ -392,11 +381,7 @@ async function processOtpTracking(chatId, userId, fullNumber) {
 
                if (latestSms) {
                    const smsHash = `${latestSms.text}_${latestSms.time}`;
-                   const lastSeen = seenOtp.get(fullNumber);
-
-                   if (lastSeen === smsHash) {
-                       // SMS lama, lanjut polling
-                   } else {
+                   if (seenOtp.get(fullNumber) !== smsHash) {
                        seenOtp.set(fullNumber, smsHash);
                        otpFound = true;
 
@@ -427,7 +412,7 @@ async function processOtpTracking(chatId, userId, fullNumber) {
        bot.deleteMessage(chatId, statusMsg.message_id).catch(() => {});
        bot.sendMessage(chatId,
            UI.header('Timeout') +
-           `⏱️ <b>Batas Waktu Habis</b>\nOTP tidak tiba di nomor <code>${fullNumber}</code> setelah 80 detik.\n` +
+           `⏱️ <b>Batas Waktu Habis</b>\nOTP tidak tiba di <code>${fullNumber}</code> setelah 80 detik.\n` +
            UI.divider + UI.footer,
            { parse_mode: 'HTML' }
        );
@@ -463,13 +448,13 @@ bot.on('callback_query', async (query) => {
            );
        }
 
-       // ── TAMBAH / UPDATE AKUN ──
+       // ── TAMBAH AKUN ──
        else if (action === 'btn_add_account') {
            bot.deleteMessage(chatId, messageId).catch(() => {});
            bot.sendMessage(chatId,
                `⚙️ <b>Balas (reply) pesan ini dengan format:</b>\n\n` +
                `<code>NAMA_AKUN ivas_sms_session xsrf_token</code>\n\n` +
-               `<i>Pisahkan dengan spasi. Dapatkan cookies dari browser setelah login manual ke ivasms.com</i>`,
+               `<i>Dapatkan cookies dari browser setelah login manual ke ivasms.com</i>`,
                { parse_mode: 'HTML', reply_markup: { force_reply: true, selective: true } }
            );
        }
@@ -484,17 +469,14 @@ bot.on('callback_query', async (query) => {
            } else {
                text += `📊 <b>Total: ${accounts.length} Akun</b>\n\n`;
                accounts.forEach((acc, i) => {
-                   const status = acc.session_valid ? '🟢 Aktif' : '🔴 Expired';
                    text += `<b>${i + 1}. [${acc.name}]</b>\n`;
-                   text += `   Status: ${status}\n`;
+                   text += `   Status: ${acc.session_valid ? '🟢 Aktif' : '🔴 Expired'}\n`;
                    text += `   Sync: <code>${acc.updated_at}</code>\n\n`;
                });
            }
-
            text += UI.divider;
            text += `<i>cf_clearance auto-refresh setiap 45 menit</i>\n`;
            text += UI.divider + UI.footer;
-
            bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.backButton });
        }
 
@@ -502,8 +484,8 @@ bot.on('callback_query', async (query) => {
        else if (action === 'btn_mynumbers') {
            bot.answerCallbackQuery(query.id, { text: 'Mengumpulkan data...', show_alert: false });
            const accounts = await dbAll('SELECT * FROM ivas_accounts WHERE session_valid = 1');
-
            let allNumbers = [];
+
            for (const acc of accounts) {
                try {
                    const params = new URLSearchParams({ draw: 1, start: 0, length: 2000, 'search[value]': '' });
@@ -540,7 +522,6 @@ bot.on('callback_query', async (query) => {
        else if (action === 'btn_balance') {
            bot.answerCallbackQuery(query.id, { text: 'Mengkalkulasi saldo...', show_alert: false });
            const accounts = await dbAll('SELECT * FROM ivas_accounts WHERE session_valid = 1');
-
            let text = UI.header('Balance Multi-Akun');
 
            if (accounts.length === 0) {
@@ -560,27 +541,22 @@ bot.on('callback_query', async (query) => {
                        const revenue = $('div:contains("REVENUE")').parent().find('.text-white, .font-bold').first().text().trim() || 'N/A';
                        text += `🗄️ <b>[${acc.name}]</b>\n💰 Saldo: <b>${revenue}</b>\n\n`;
                    } catch (e) {
-                       text += `🗄️ <b>[${acc.name}]</b>\n⚠️ Gagal memuat: <i>${e.message}</i>\n\n`;
+                       text += `🗄️ <b>[${acc.name}]</b>\n⚠️ Gagal: <i>${e.message}</i>\n\n`;
                    }
                }
            }
-
            text += UI.divider + UI.footer;
            bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.backButton });
        }
 
-       // ── ADMIN CONSOLE (SUPERADMIN) ──
+       // ── ADMIN CONSOLE ──
        else if (action === 'btn_admin' && auth.role === 'superadmin') {
            const rows = await dbAll('SELECT telegram_id, created_at FROM users WHERE role = "admin"');
            let text = UI.header('Admin Console');
            text += `📋 <b>Admin Aktif: ${rows.length}</b>\n\n`;
-           if (rows.length === 0) {
-               text += `<i>Belum ada admin.</i>\n\n`;
-           } else {
-               rows.forEach((row, i) => { text += `${i + 1}. <code>${row.telegram_id}</code>\n`; });
-               text += '\n';
-           }
-           text += UI.divider + UI.footer;
+           rows.forEach((row, i) => { text += `${i + 1}. <code>${row.telegram_id}</code>\n`; });
+           if (rows.length === 0) text += `<i>Belum ada admin.</i>\n`;
+           text += '\n' + UI.divider + UI.footer;
 
            bot.editMessageText(text, {
                chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
@@ -624,7 +600,7 @@ bot.on('message', async (msg) => {
    const auth = await isAuthorized(userId);
    if (!auth.authorized) return;
 
-   // ── HANDLER: CARI OTP ──
+   // ── CARI OTP ──
    if (promptText.includes('FULL NOMOR')) {
        const fullNumber = text.replace(/\D/g, '');
        if (fullNumber.length < 8) {
@@ -633,7 +609,7 @@ bot.on('message', async (msg) => {
        await processOtpTracking(chatId, userId, fullNumber);
    }
 
-   // ── HANDLER: TAMBAH / UPDATE AKUN ──
+   // ── TAMBAH / UPDATE AKUN ──
    else if (promptText.includes('NAMA_AKUN ivas_sms_session')) {
        const parts = text.split(/\s+/);
        if (parts.length < 3) {
@@ -668,10 +644,9 @@ bot.on('message', async (msg) => {
        }
    }
 
-   // ── HANDLER: TAMBAH ADMIN ──
+   // ── TAMBAH ADMIN ──
    else if (promptText.includes('ID Telegram Admin Baru')) {
        if (auth.role !== 'superadmin') return bot.sendMessage(chatId, '❌ Akses Ditolak!');
-
        const targetId = parseInt(text.replace(/\D/g, ''));
        if (isNaN(targetId)) return bot.sendMessage(chatId, '❌ ID tidak valid!');
 
