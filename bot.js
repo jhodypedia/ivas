@@ -85,138 +85,6 @@ function buildCookieString(account) {
 }
 
 // ==========================================
-// 🕸️ FLARESOLVERR — HANYA UNTUK cf_clearance
-// ==========================================
-async function getCfClearance() {
-   console.log('🔄 [FlareSolverr] Mengambil cf_clearance...');
-
-   let retries = 3;
-   while (retries > 0) {
-       try {
-           const res = await axios.post(FLARE_URL, {
-               cmd: 'request.get',
-               url: BASE_URL,
-               maxTimeout: 120000,
-           }, {
-               timeout: 180000, // 3 menit — beri waktu cukup untuk solve challenge
-           });
-
-           if (res.data.status !== 'ok') {
-               throw new Error(`FlareSolverr error: ${res.data.message}`);
-           }
-
-           const solution = res.data.solution;
-           const cfCookie = solution.cookies.find(c => c.name === 'cf_clearance');
-
-           if (!cfCookie?.value) {
-               throw new Error('cf_clearance tidak ditemukan dalam response');
-           }
-
-           console.log(`✅ [FlareSolverr] cf_clearance berhasil didapat`);
-           console.log(`   UA: ${solution.userAgent}`);
-
-           return {
-               cf_clearance: cfCookie.value,
-               userAgent: solution.userAgent,
-               expiry: cfCookie.expiry,
-           };
-
-       } catch (err) {
-           retries--;
-           console.error(`❌ [FlareSolverr] Gagal: ${err.message} | Sisa retry: ${retries}`);
-           if (retries > 0) {
-               console.log('⏳ Tunggu 10 detik sebelum retry...');
-               await delay(10000);
-           }
-       }
-   }
-
-   throw new Error('FlareSolverr gagal setelah 3 kali percobaan. Cek docker logs flaresolverr');
-}
-
-// ==========================================
-// 🔄 SESSION MANAGEMENT
-// ==========================================
-async function refreshCfClearance(accountName, ivasSession, xsrfToken) {
-   // Step 1: Ambil cf_clearance baru dari FlareSolverr
-   const { cf_clearance, userAgent } = await getCfClearance();
-
-   // Step 2: Validasi session masih hidup
-   let csrfToken = null;
-   let sessionValid = 1;
-
-   try {
-       const res = await axios.get(`${BASE_URL}/portal`, {
-           headers: {
-               'User-Agent': userAgent,
-               'Cookie': `ivas_sms_session=${ivasSession}; XSRF-TOKEN=${xsrfToken}; cf_clearance=${cf_clearance}`,
-               'Accept': 'text/html,application/xhtml+xml',
-               'Accept-Language': 'en-US,en;q=0.9',
-               'Referer': BASE_URL,
-           },
-           maxRedirects: 5,
-           timeout: 30000,
-       });
-
-       const finalUrl = res.request?.res?.responseUrl || '';
-
-       if (finalUrl.includes('/login') || (res.data && res.data.includes('Account Login'))) {
-           sessionValid = 0;
-           console.warn(`⚠️ [${accountName}] Session expired!`);
-       } else {
-           const $ = cheerio.load(res.data);
-           csrfToken = $('meta[name="csrf-token"]').attr('content') || null;
-           console.log(`✅ [${accountName}] Session valid | CSRF: ${csrfToken ? csrfToken.substring(0, 16) + '...' : 'N/A'}`);
-       }
-
-   } catch (err) {
-       console.error(`⚠️ [${accountName}] Gagal validasi portal: ${err.message}`);
-   }
-
-   // Step 3: Simpan ke database
-   await dbRun(`
-       INSERT INTO ivas_accounts (name, ivas_sms_session, xsrf_token, cf_clearance, csrf_token, user_agent, session_valid, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-       ON CONFLICT(name) DO UPDATE SET
-           cf_clearance  = excluded.cf_clearance,
-           csrf_token    = excluded.csrf_token,
-           user_agent    = excluded.user_agent,
-           session_valid = excluded.session_valid,
-           updated_at    = CURRENT_TIMESTAMP
-   `, [accountName, ivasSession, xsrfToken, cf_clearance, csrfToken, userAgent, sessionValid]);
-
-   if (sessionValid === 0) {
-       throw new Error(`Session akun [${accountName}] expired! Perlu update cookies manual.`);
-   }
-
-   return { cf_clearance, csrfToken, userAgent };
-}
-
-async function refreshAllAccounts(notifyOnError = true) {
-   const accounts = await dbAll('SELECT * FROM ivas_accounts');
-   if (accounts.length === 0) {
-       console.log('ℹ️ Belum ada akun terdaftar.');
-       return;
-   }
-
-   for (const acc of accounts) {
-       try {
-           await refreshCfClearance(acc.name, acc.ivas_sms_session, acc.xsrf_token);
-           console.log(`✅ [${acc.name}] Refresh berhasil.`);
-       } catch (err) {
-           console.error(`❌ [${acc.name}] ${err.message}`);
-           if (notifyOnError) {
-               bot.sendMessage(SUPERADMIN_ID,
-                   `⚠️ <b>SESSION EXPIRED</b>\n\nAkun <code>[${acc.name}]</code> perlu update cookies.\n\nGunakan menu ⚙️ <b>Tambah/Update Akun iVAS</b>.`,
-                   { parse_mode: 'HTML' }
-               ).catch(() => {});
-           }
-       }
-       await delay(3000);
-   }
-}
-
-// ==========================================
 // 🎨 UI TEMPLATE & KEYBOARDS
 // ==========================================
 const UI = {
@@ -240,7 +108,27 @@ const KEYBOARDS = {
        return { reply_markup: { inline_keyboard: kb } };
    },
    backButton: {
-       reply_markup: { inline_keyboard: [[{ text: '🔙 Kembali ke Dashboard', callback_data: 'btn_main' }]] },
+       reply_markup: {
+           inline_keyboard: [[{ text: '🔙 Kembali ke Dashboard', callback_data: 'btn_main' }]],
+       },
+   },
+   adminConsole: {
+       reply_markup: {
+           inline_keyboard: [
+               [{ text: '➕ Tambah Admin', callback_data: 'btn_add_admin_prompt' }],
+               [{ text: '🗑️ Hapus Admin', callback_data: 'btn_del_admin_prompt' }],
+               [{ text: '🔙 Kembali ke Dashboard', callback_data: 'btn_main' }],
+           ],
+       },
+   },
+   accountMenu: {
+       reply_markup: {
+           inline_keyboard: [
+               [{ text: '🔄 Refresh Semua Akun', callback_data: 'btn_refresh_accounts' }],
+               [{ text: '🗑️ Hapus Akun', callback_data: 'btn_del_account_prompt' }],
+               [{ text: '🔙 Kembali ke Dashboard', callback_data: 'btn_main' }],
+           ],
+       },
    },
 };
 
@@ -273,6 +161,108 @@ async function renderMainMenu(chatId, userId, messageId = null) {
 }
 
 // ==========================================
+// 🕸️ FLARESOLVERR
+// ==========================================
+async function getCfClearance() {
+   console.log('🔄 [FlareSolverr] Mengambil cf_clearance...');
+   let retries = 3;
+   while (retries > 0) {
+       try {
+           const res = await axios.post(FLARE_URL, {
+               cmd: 'request.get',
+               url: BASE_URL,
+               maxTimeout: 120000,
+           }, { timeout: 180000 });
+
+           if (res.data.status !== 'ok') throw new Error(`FlareSolverr error: ${res.data.message}`);
+
+           const solution = res.data.solution;
+           const cfCookie = solution.cookies.find(c => c.name === 'cf_clearance');
+           if (!cfCookie?.value) throw new Error('cf_clearance tidak ditemukan');
+
+           console.log(`✅ [FlareSolverr] cf_clearance berhasil didapat`);
+           return { cf_clearance: cfCookie.value, userAgent: solution.userAgent };
+       } catch (err) {
+           retries--;
+           console.error(`❌ [FlareSolverr] Gagal: ${err.message} | Sisa retry: ${retries}`);
+           if (retries > 0) await delay(10000);
+       }
+   }
+   throw new Error('FlareSolverr gagal setelah 3 kali percobaan.');
+}
+
+// ==========================================
+// 🔄 SESSION MANAGEMENT
+// ==========================================
+async function refreshCfClearance(accountName, ivasSession, xsrfToken) {
+   const { cf_clearance, userAgent } = await getCfClearance();
+
+   let csrfToken = null;
+   let sessionValid = 1;
+
+   try {
+       const res = await axios.get(`${BASE_URL}/portal`, {
+           headers: {
+               'User-Agent': userAgent,
+               'Cookie': `ivas_sms_session=${ivasSession}; XSRF-TOKEN=${xsrfToken}; cf_clearance=${cf_clearance}`,
+               'Accept': 'text/html,application/xhtml+xml',
+               'Accept-Language': 'en-US,en;q=0.9',
+               'Referer': BASE_URL,
+           },
+           maxRedirects: 5,
+           timeout: 30000,
+       });
+
+       const finalUrl = res.request?.res?.responseUrl || '';
+       if (finalUrl.includes('/login') || (res.data && res.data.includes('Account Login'))) {
+           sessionValid = 0;
+           console.warn(`⚠️ [${accountName}] Session expired!`);
+       } else {
+           const $ = cheerio.load(res.data);
+           csrfToken = $('meta[name="csrf-token"]').attr('content') || null;
+           console.log(`✅ [${accountName}] Session valid`);
+       }
+   } catch (err) {
+       console.error(`⚠️ [${accountName}] Gagal validasi portal: ${err.message}`);
+   }
+
+   await dbRun(`
+       INSERT INTO ivas_accounts (name, ivas_sms_session, xsrf_token, cf_clearance, csrf_token, user_agent, session_valid, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+       ON CONFLICT(name) DO UPDATE SET
+           cf_clearance  = excluded.cf_clearance,
+           csrf_token    = excluded.csrf_token,
+           user_agent    = excluded.user_agent,
+           session_valid = excluded.session_valid,
+           updated_at    = CURRENT_TIMESTAMP
+   `, [accountName, ivasSession, xsrfToken, cf_clearance, csrfToken, userAgent, sessionValid]);
+
+   if (sessionValid === 0) throw new Error(`Session akun [${accountName}] expired! Perlu update cookies manual.`);
+   return { cf_clearance, csrfToken, userAgent };
+}
+
+async function refreshAllAccounts(notifyOnError = true) {
+   const accounts = await dbAll('SELECT * FROM ivas_accounts');
+   if (accounts.length === 0) { console.log('ℹ️ Belum ada akun.'); return; }
+
+   for (const acc of accounts) {
+       try {
+           await refreshCfClearance(acc.name, acc.ivas_sms_session, acc.xsrf_token);
+           console.log(`✅ [${acc.name}] Refresh berhasil.`);
+       } catch (err) {
+           console.error(`❌ [${acc.name}] ${err.message}`);
+           if (notifyOnError) {
+               bot.sendMessage(SUPERADMIN_ID,
+                   `⚠️ <b>SESSION EXPIRED</b>\n\nAkun <code>[${acc.name}]</code> perlu update cookies.\n\nGunakan menu ⚙️ <b>Tambah/Update Akun iVAS</b>.`,
+                   { parse_mode: 'HTML' }
+               ).catch(() => {});
+           }
+       }
+       await delay(3000);
+   }
+}
+
+// ==========================================
 // 🔄 LIVE OTP TRACKING
 // ==========================================
 const seenOtp = new Map();
@@ -282,7 +272,7 @@ async function processOtpTracking(chatId, userId, fullNumber) {
    if (accounts.length === 0) {
        return bot.sendMessage(chatId,
            UI.header('Sistem Kosong') + `❌ Belum ada akun iVAS aktif.\n` + UI.divider + UI.footer,
-           { parse_mode: 'HTML' }
+           { parse_mode: 'HTML', ...KEYBOARDS.backButton }
        );
    }
 
@@ -291,7 +281,6 @@ async function processOtpTracking(chatId, userId, fullNumber) {
        { parse_mode: 'HTML' }
    );
 
-   // Auto-routing: cari akun pemilik nomor
    let targetAccount = null;
    for (const acc of accounts) {
        try {
@@ -319,11 +308,10 @@ async function processOtpTracking(chatId, userId, fullNumber) {
            UI.header('Hasil Radar') +
            `📭 Nomor <code>${fullNumber}</code> tidak ditemukan di semua akun.\n` +
            UI.divider + UI.footer,
-           { parse_mode: 'HTML' }
+           { parse_mode: 'HTML', ...KEYBOARDS.backButton }
        );
    }
 
-   // Polling OTP
    const MAX_ATTEMPTS = 20;
    const dateStr = new Date().toISOString().split('T')[0];
    let otpFound = false;
@@ -396,7 +384,7 @@ async function processOtpTracking(chatId, userId, fullNumber) {
                        reply += `🗄️ <b>Via Akun:</b> <i>${targetAccount.name}</i>\n`;
                        reply += UI.divider + UI.footer;
 
-                       bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
+                       bot.sendMessage(chatId, reply, { parse_mode: 'HTML', ...KEYBOARDS.backButton });
                        break;
                    }
                }
@@ -414,7 +402,7 @@ async function processOtpTracking(chatId, userId, fullNumber) {
            UI.header('Timeout') +
            `⏱️ <b>Batas Waktu Habis</b>\nOTP tidak tiba di <code>${fullNumber}</code> setelah 80 detik.\n` +
            UI.divider + UI.footer,
-           { parse_mode: 'HTML' }
+           { parse_mode: 'HTML', ...KEYBOARDS.backButton }
        );
    }
 }
@@ -441,22 +429,48 @@ bot.on('callback_query', async (query) => {
 
        // ── GET OTP ──
        else if (action === 'btn_get_otp') {
-           bot.deleteMessage(chatId, messageId).catch(() => {});
-           bot.sendMessage(chatId,
-               `🔍 <b>Balas (reply) pesan ini dengan FULL NOMOR target:</b>\n<i>Tanpa + atau spasi, contoh: 6281234567890</i>`,
-               { parse_mode: 'HTML', reply_markup: { force_reply: true, selective: true } }
-           );
+           let text = UI.header('Dapatkan OTP');
+           text += `📱 <b>Balas (reply) pesan ini dengan FULL NOMOR target:</b>\n`;
+           text += `<i>Tanpa + atau spasi, contoh: 6281234567890</i>\n`;
+           text += UI.divider + UI.footer;
+           bot.editMessageText(text, {
+               chat_id: chatId,
+               message_id: messageId,
+               parse_mode: 'HTML',
+               reply_markup: {
+                   inline_keyboard: [
+                       [{ text: '🔙 Kembali ke Dashboard', callback_data: 'btn_main' }],
+                   ],
+               },
+           }).catch(() => {
+               bot.sendMessage(chatId, text, {
+                   parse_mode: 'HTML',
+                   reply_markup: {
+                       force_reply: true,
+                       selective: true,
+                       inline_keyboard: [[{ text: '🔙 Kembali ke Dashboard', callback_data: 'btn_main' }]],
+                   },
+               });
+           });
        }
 
        // ── TAMBAH AKUN ──
        else if (action === 'btn_add_account') {
-           bot.deleteMessage(chatId, messageId).catch(() => {});
-           bot.sendMessage(chatId,
-               `⚙️ <b>Balas (reply) pesan ini dengan format:</b>\n\n` +
-               `<code>NAMA_AKUN ivas_sms_session xsrf_token</code>\n\n` +
-               `<i>Dapatkan cookies dari browser setelah login manual ke ivasms.com</i>`,
-               { parse_mode: 'HTML', reply_markup: { force_reply: true, selective: true } }
-           );
+           let text = UI.header('Tambah/Update Akun');
+           text += `⚙️ <b>Balas (reply) pesan ini dengan format:</b>\n\n`;
+           text += `<code>NAMA_AKUN ivas_sms_session xsrf_token</code>\n\n`;
+           text += `<i>Dapatkan cookies dari browser setelah login manual ke ivasms.com</i>\n`;
+           text += UI.divider + UI.footer;
+           bot.editMessageText(text, {
+               chat_id: chatId,
+               message_id: messageId,
+               parse_mode: 'HTML',
+               reply_markup: {
+                   inline_keyboard: [
+                       [{ text: '🔙 Kembali ke Dashboard', callback_data: 'btn_main' }],
+                   ],
+               },
+           }).catch(() => {});
        }
 
        // ── STATUS AKUN ──
@@ -477,7 +491,76 @@ bot.on('callback_query', async (query) => {
            text += UI.divider;
            text += `<i>cf_clearance auto-refresh setiap 45 menit</i>\n`;
            text += UI.divider + UI.footer;
-           bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.backButton });
+
+           bot.editMessageText(text, {
+               chat_id: chatId,
+               message_id: messageId,
+               parse_mode: 'HTML',
+               ...KEYBOARDS.accountMenu,
+           });
+       }
+
+       // ── REFRESH SEMUA AKUN ──
+       else if (action === 'btn_refresh_accounts') {
+           bot.answerCallbackQuery(query.id, { text: 'Memulai refresh...', show_alert: false });
+           bot.editMessageText(
+               UI.header('Refresh Akun') + `🔄 Sedang refresh semua akun...\n` + UI.divider + UI.footer,
+               { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' }
+           ).catch(() => {});
+
+           await refreshAllAccounts(true);
+
+           const accounts = await dbAll('SELECT name, session_valid FROM ivas_accounts');
+           let text = UI.header('Refresh Selesai');
+           accounts.forEach(acc => {
+               text += `${acc.session_valid ? '🟢' : '🔴'} <b>[${acc.name}]</b>\n`;
+           });
+           text += UI.divider + UI.footer;
+
+           bot.editMessageText(text, {
+               chat_id: chatId,
+               message_id: messageId,
+               parse_mode: 'HTML',
+               ...KEYBOARDS.accountMenu,
+           }).catch(() => {});
+       }
+
+       // ── HAPUS AKUN ──
+       else if (action === 'btn_del_account_prompt' && auth.role === 'superadmin') {
+           const accounts = await dbAll('SELECT name FROM ivas_accounts');
+           if (accounts.length === 0) {
+               return bot.answerCallbackQuery(query.id, { text: 'Tidak ada akun!', show_alert: true });
+           }
+
+           const kb = accounts.map(acc => ([{
+               text: `🗑️ ${acc.name}`,
+               callback_data: `btn_del_account_${acc.name}`,
+           }]));
+           kb.push([{ text: '🔙 Kembali', callback_data: 'btn_status' }]);
+
+           bot.editMessageText(
+               UI.header('Hapus Akun') + `Pilih akun yang ingin dihapus:\n` + UI.divider + UI.footer,
+               { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } }
+           );
+       }
+
+       else if (action.startsWith('btn_del_account_') && auth.role === 'superadmin') {
+           const name = action.replace('btn_del_account_', '');
+           await dbRun('DELETE FROM ivas_accounts WHERE name = ?', [name]);
+           bot.answerCallbackQuery(query.id, { text: `✅ Akun [${name}] dihapus`, show_alert: true });
+           const accounts = await dbAll('SELECT name, session_valid, updated_at FROM ivas_accounts');
+           let text = UI.header('Status Multi-Akun');
+           if (accounts.length === 0) {
+               text += `❌ Belum ada akun terdaftar.\n`;
+           } else {
+               accounts.forEach((acc, i) => {
+                   text += `<b>${i + 1}. [${acc.name}]</b>\n`;
+                   text += `   Status: ${acc.session_valid ? '🟢 Aktif' : '🔴 Expired'}\n`;
+                   text += `   Sync: <code>${acc.updated_at}</code>\n\n`;
+               });
+           }
+           text += UI.divider + UI.footer;
+           bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.accountMenu });
        }
 
        // ── DAFTAR NOMOR ──
@@ -557,24 +640,53 @@ bot.on('callback_query', async (query) => {
            rows.forEach((row, i) => { text += `${i + 1}. <code>${row.telegram_id}</code>\n`; });
            if (rows.length === 0) text += `<i>Belum ada admin.</i>\n`;
            text += '\n' + UI.divider + UI.footer;
-
-           bot.editMessageText(text, {
-               chat_id: chatId, message_id: messageId, parse_mode: 'HTML',
-               reply_markup: {
-                   inline_keyboard: [
-                       [{ text: '➕ Tambah Admin', callback_data: 'btn_add_admin_prompt' }],
-                       [{ text: '🔙 Kembali', callback_data: 'btn_main' }],
-                   ],
-               },
-           });
+           bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.adminConsole });
        }
 
        else if (action === 'btn_add_admin_prompt' && auth.role === 'superadmin') {
-           bot.deleteMessage(chatId, messageId).catch(() => {});
-           bot.sendMessage(chatId,
-               `👑 <b>Balas (reply) pesan ini dengan ID Telegram Admin Baru:</b>`,
-               { parse_mode: 'HTML', reply_markup: { force_reply: true, selective: true } }
+           let text = UI.header('Tambah Admin');
+           text += `👑 <b>Balas (reply) pesan ini dengan ID Telegram Admin Baru:</b>\n`;
+           text += UI.divider + UI.footer;
+           bot.editMessageText(text, {
+               chat_id: chatId,
+               message_id: messageId,
+               parse_mode: 'HTML',
+               reply_markup: {
+                   inline_keyboard: [[{ text: '🔙 Kembali ke Admin Console', callback_data: 'btn_admin' }]],
+               },
+           }).catch(() => {});
+       }
+
+       else if (action === 'btn_del_admin_prompt' && auth.role === 'superadmin') {
+           const rows = await dbAll('SELECT telegram_id FROM users WHERE role = "admin"');
+           if (rows.length === 0) {
+               return bot.answerCallbackQuery(query.id, { text: 'Tidak ada admin!', show_alert: true });
+           }
+
+           const kb = rows.map(row => ([{
+               text: `🗑️ ${row.telegram_id}`,
+               callback_data: `btn_del_admin_${row.telegram_id}`,
+           }]));
+           kb.push([{ text: '🔙 Kembali ke Admin Console', callback_data: 'btn_admin' }]);
+
+           bot.editMessageText(
+               UI.header('Hapus Admin') + `Pilih admin yang ingin dihapus:\n` + UI.divider + UI.footer,
+               { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: { inline_keyboard: kb } }
            );
+       }
+
+       else if (action.startsWith('btn_del_admin_') && auth.role === 'superadmin') {
+           const targetId = parseInt(action.replace('btn_del_admin_', ''));
+           await dbRun('DELETE FROM users WHERE telegram_id = ? AND role = "admin"', [targetId]);
+           bot.answerCallbackQuery(query.id, { text: `✅ Admin ${targetId} dihapus`, show_alert: true });
+
+           const rows = await dbAll('SELECT telegram_id, created_at FROM users WHERE role = "admin"');
+           let text = UI.header('Admin Console');
+           text += `📋 <b>Admin Aktif: ${rows.length}</b>\n\n`;
+           rows.forEach((row, i) => { text += `${i + 1}. <code>${row.telegram_id}</code>\n`; });
+           if (rows.length === 0) text += `<i>Belum ada admin.</i>\n`;
+           text += '\n' + UI.divider + UI.footer;
+           bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', ...KEYBOARDS.adminConsole });
        }
 
        bot.answerCallbackQuery(query.id);
@@ -604,7 +716,10 @@ bot.on('message', async (msg) => {
    if (promptText.includes('FULL NOMOR')) {
        const fullNumber = text.replace(/\D/g, '');
        if (fullNumber.length < 8) {
-           return bot.sendMessage(chatId, '❌ <b>Format salah!</b> Masukkan nomor lengkap.', { parse_mode: 'HTML' });
+           return bot.sendMessage(chatId,
+               '❌ <b>Format salah!</b> Masukkan nomor lengkap.',
+               { parse_mode: 'HTML', ...KEYBOARDS.backButton }
+           );
        }
        await processOtpTracking(chatId, userId, fullNumber);
    }
@@ -615,7 +730,7 @@ bot.on('message', async (msg) => {
        if (parts.length < 3) {
            return bot.sendMessage(chatId,
                '❌ <b>Format salah!</b>\nGunakan: <code>NAMA_AKUN ivas_session xsrf_token</code>',
-               { parse_mode: 'HTML' }
+               { parse_mode: 'HTML', ...KEYBOARDS.backButton }
            );
        }
 
@@ -627,7 +742,6 @@ bot.on('message', async (msg) => {
 
        try {
            const data = await refreshCfClearance(accountName, ivasSession, xsrfToken);
-
            let reply = UI.header('Akun Terhubung');
            reply += `✅ <b>Akun [${accountName}] Berhasil!</b>\n\n`;
            reply += `🔑 <b>CSRF Token:</b> <code>${data.csrfToken ? data.csrfToken.substring(0, 20) + '...' : 'N/A'}</code>\n`;
@@ -636,11 +750,10 @@ bot.on('message', async (msg) => {
            reply += UI.divider + UI.footer;
 
            bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
-           bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
-
+           bot.sendMessage(chatId, reply, { parse_mode: 'HTML', ...KEYBOARDS.backButton });
        } catch (e) {
            bot.deleteMessage(chatId, loadingMsg.message_id).catch(() => {});
-           bot.sendMessage(chatId, UI.error(e.message), { parse_mode: 'HTML' });
+           bot.sendMessage(chatId, UI.error(e.message), { parse_mode: 'HTML', ...KEYBOARDS.backButton });
        }
    }
 
@@ -648,7 +761,7 @@ bot.on('message', async (msg) => {
    else if (promptText.includes('ID Telegram Admin Baru')) {
        if (auth.role !== 'superadmin') return bot.sendMessage(chatId, '❌ Akses Ditolak!');
        const targetId = parseInt(text.replace(/\D/g, ''));
-       if (isNaN(targetId)) return bot.sendMessage(chatId, '❌ ID tidak valid!');
+       if (isNaN(targetId)) return bot.sendMessage(chatId, '❌ ID tidak valid!', KEYBOARDS.backButton);
 
        try {
            await dbRun(
@@ -659,10 +772,10 @@ bot.on('message', async (msg) => {
                UI.header('Admin Added') +
                `✅ <b>Admin Ditambahkan</b>\n🔹 ID: <code>${targetId}</code>\n` +
                UI.divider + UI.footer,
-               { parse_mode: 'HTML' }
+               { parse_mode: 'HTML', ...KEYBOARDS.adminConsole }
            );
        } catch (e) {
-           bot.sendMessage(chatId, UI.error(e.message), { parse_mode: 'HTML' });
+           bot.sendMessage(chatId, UI.error(e.message), { parse_mode: 'HTML', ...KEYBOARDS.backButton });
        }
    }
 });
@@ -672,11 +785,9 @@ bot.on('message', async (msg) => {
 // ==========================================
 async function bootstrap() {
    await initDb();
-
    console.log('🔄 [BOOT] Sinkronisasi semua akun...');
    await refreshAllAccounts(true);
 
-   // Auto-refresh cf_clearance setiap 45 menit
    setInterval(async () => {
        console.log('🔄 [AUTO-REFRESH] Memperbarui cf_clearance...');
        await refreshAllAccounts(true);
